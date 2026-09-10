@@ -26,6 +26,16 @@ class HarnessTests(unittest.TestCase):
             self.assertIsNone(result.detected_output_path)
             self.assertEqual(result.confidence, "uncertain")
 
+    def test_tooling_directories_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tooling = root / ".codex" / "docs"
+            tooling.mkdir(parents=True)
+            (tooling / "example.md").write_text("--output /tmp/example\n", encoding="utf-8")
+            (root / "README.md").write_text("output_path: ./runs/\n", encoding="utf-8")
+            result = detect_output_paths(root)
+            self.assertEqual(result.detected_output_path, "./runs")
+
     def test_runner_records_metadata_without_copying_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

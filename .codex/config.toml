@@ -1,0 +1,13 @@
+model = "gpt-6-astra"
+model_provider = "anyrouter"
+preferred_auth_method = "apikey"
+model_reasoning_effort = "high"
+
+
+[model_providers.anyrouter]
+name = "Any Router"
+base_url = "https://anyrouter.top"
+wire_api = "responses"
+
+[projects."/home/heol/AI/own_implement/RL_Paper_Reproduction"]
+trust_level = "trusted"

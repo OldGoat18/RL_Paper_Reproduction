@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+import os
+import tempfile
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,6 +26,15 @@ class ExecutionMetadata:
     status: str
     detected_output_path: Optional[str]
     output_path_confidence: str
+    output_candidates: list[dict[str, Any]] = field(default_factory=list)
+    error: Optional[str] = None
+    supervisor_id: Optional[str] = None
+    working_directory: Optional[str] = None
+    environment_setup: dict[str, object] = field(default_factory=dict)
+    stdout: str = ""
+    stderr: str = ""
+    resource_request: dict[str, object] = field(default_factory=dict)
+    launch_environment: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -31,5 +42,13 @@ class ExecutionMetadata:
     def write(self, metadata_root: str | Path) -> Path:
         destination = Path(metadata_root).expanduser() / "executions" / f"{self.execution_id}.json"
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        descriptor, temporary = tempfile.mkstemp(dir=destination.parent, suffix=".tmp")
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(self.to_dict(), stream, indent=2, sort_keys=True)
+                stream.write("\n")
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
         return destination

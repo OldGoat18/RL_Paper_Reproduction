@@ -9,6 +9,7 @@ from typing import List, Optional
 
 from .detector import detect_output_paths
 from .runner import run_project
+from .web import serve
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -17,6 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     detect = subparsers.add_parser("detect", help="Detect output paths from project files")
     detect.add_argument("project", nargs="?", default=".")
+    detect.add_argument("--llm", action="store_true")
 
     run = subparsers.add_parser("run", help="Run a project command and record execution metadata")
     run.add_argument("project", nargs="?", default=".")
@@ -25,10 +27,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--repeat", type=int)
     run.add_argument("--metadata-root", default=".harness")
     run.add_argument("--output", dest="output_override", help="Manually override the detected output path")
+    web = subparsers.add_parser("web", help="Serve a local execution metadata viewer")
+    web.add_argument("--metadata-root", default=".harness")
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8765)
+    web.add_argument("--project", action="append", default=[])
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def _main(argv: Optional[List[str]] = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     command: List[str] = []
     # Split at the conventional delimiter before argparse sees the project's
@@ -39,7 +46,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         raw_argv = raw_argv[:delimiter]
     args = build_parser().parse_args(raw_argv)
     if args.subcommand == "detect":
-        print(json.dumps(detect_output_paths(args.project).to_dict(), indent=2))
+        from .llm import detect_with_llm
+        print(json.dumps((detect_with_llm if args.llm else detect_output_paths)(args.project, command).to_dict(), indent=2))
+        return 0
+    if args.subcommand == "web":
+        serve(args.metadata_root, args.host, args.port, args.project)
         return 0
     if not command:
         print("run requires a command (for example: rl-harness run . -- python train.py)", file=sys.stderr)
@@ -55,6 +66,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     print(json.dumps({"execution": metadata.to_dict(), "detection": detection.to_dict()}, indent=2))
     return exit_code
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    try:
+        return _main(argv)
+    except (OSError, ValueError) as exc:
+        print(f"rl-harness: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

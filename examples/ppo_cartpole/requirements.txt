@@ -1,0 +1,5 @@
+stable-baselines3==2.4.0
+gymnasium[classic-control]==0.29.1
+torch>=2.3,<3
+numpy>=1.24,<2
+matplotlib>=3.5,<4

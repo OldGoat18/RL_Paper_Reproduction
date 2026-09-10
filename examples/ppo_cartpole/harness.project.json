@@ -1,0 +1,8 @@
+{
+  "name": "PPO / CartPole-v1",
+  "tasks": {
+    "train": "{python} train.py --config config.json --seed {seed} --repeat {repeat} --output ./runs/seed_{seed}/repeat_{repeat}",
+    "evaluate": "{python} evaluate.py --model ./runs/seed_{seed}/repeat_{repeat}/model.zip --seed {seed} --episodes 20 --output ./runs/seed_{seed}/repeat_{repeat}/evaluation",
+    "report": "{python} report.py --runs ./runs --output ./reports"
+  }
+}

@@ -5,3 +5,7 @@ __pycache__/
 .harness/
 .coverage
 .claude/settings.json
+examples/ppo_cartpole/runs/
+examples/ppo_cartpole/reports/
+build/
+dist/

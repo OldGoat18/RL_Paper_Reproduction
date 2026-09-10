@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="harness-token" content="__CSRF_TOKEN__">
+  <title>Reproduction Lab</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/lucide.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/"><span class="brand-mark"><i data-lucide="workflow"></i></span><span>Reproduction<br><strong>Lab</strong></span></a>
+    <div class="workspace-label">Workspace</div>
+    <nav><button class="nav-item active" data-view="executions"><i data-lucide="layers"></i>Experiments</button><button class="nav-item" data-view="resources"><i data-lucide="activity"></i>Resources</button><button class="nav-item" data-view="project"><i data-lucide="folder-git-2"></i>Project setup</button></nav>
+    <div class="sidebar-bottom"><span class="connection-dot"></span><span id="connection">Local engine</span><button class="icon" id="refresh" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button></div>
+  </aside>
+  <main>
+    <header class="topbar"><span>Workspace <span class="separator">/</span> <strong id="breadcrumb">Experiments</strong></span><span class="local-label"><i data-lucide="monitor"></i>Local workspace</span></header>
+    <div class="content">
+      <div class="page-heading"><div><span class="eyebrow">RL RESEARCH</span><h1>Experiments</h1></div><button class="primary" id="new-run"><i data-lucide="play"></i>New execution</button></div>
+      <section class="project-band" aria-label="Selected project">
+        <div class="project-visual"><img src="/cartpole.png" alt="CartPole environment with a cart and an upright pole"></div>
+        <div class="project-info"><label for="project-select">Project</label><div class="project-picker"><select id="project-select" aria-label="Project"><option value="">No projects</option></select><button class="icon" id="add-project" title="Add project" aria-label="Add project"><i data-lucide="plus"></i></button></div><div id="project-path" class="mono muted">No project selected</div></div>
+        <div class="project-summary"><span>Runtime environment</span><strong id="project-runtime" class="mono">Checking...</strong><span>Output location</span><strong id="project-output" class="mono">Uncertain</strong><button class="text-button" id="analyze-project"><i data-lucide="scan-search"></i>Analyze project</button></div>
+      </section>
+      <section id="resources-view" hidden><div class="section-heading"><div><h2>Hardware resources</h2><p class="muted">Live host capacity used for execution scheduling.</p></div><button class="primary" id="resources-new-run"><i data-lucide="play"></i>New execution</button></div><div class="resource-grid"><div class="resource-card"><span>CPU usage</span><strong id="resource-cpu">-</strong><div class="resource-bar"><i id="resource-cpu-bar"></i></div></div><div class="resource-card"><span>Memory usage</span><strong id="resource-memory">-</strong><div class="resource-bar"><i id="resource-memory-bar"></i></div></div><div class="resource-card"><span>Parallel slots</span><strong id="resource-slots">-</strong><p id="resource-running" class="muted">-</p></div></div><div class="section-heading"><h2>Scheduled executions</h2></div><div id="resource-executions" class="presets"></div></section>
+      <section id="executions-view">
+        <div class="stats"><div><span>Total executions</span><strong id="total">0</strong></div><div><span><b class="dot green"></b>Running</span><strong id="running">0</strong></div><div><span><b class="dot teal"></b>Completed</span><strong id="completed">0</strong></div><div><span><b class="dot red"></b>Failed</span><strong id="failed">0</strong></div></div>
+        <div class="table-toolbar"><div class="tabs" role="tablist"><button class="selected" role="tab" aria-selected="true" data-filter="all">All executions</button><button role="tab" aria-selected="false" data-filter="running">Active</button><button role="tab" aria-selected="false" data-filter="success">Completed</button><button role="tab" aria-selected="false" data-filter="failed">Failed</button></div><label class="search"><i data-lucide="search"></i><input id="search" placeholder="Search executions" aria-label="Search executions"></label></div>
+        <div class="table-scroll"><table><thead><tr><th>Execution</th><th>Status</th><th>Seed / repeat</th><th>Started</th><th>Duration</th><th>Output</th><th></th></tr></thead><tbody id="execution-rows"></tbody></table></div>
+        <div id="empty" class="empty" hidden><i data-lucide="flask-conical"></i><h2>No executions</h2><button class="text-button" id="empty-run"><i data-lucide="play"></i>New execution</button></div>
+        <div class="table-footer"><span id="record-count">0 executions</span><span><span class="connection-dot"></span>Updated <time id="updated">now</time></span></div>
+      </section>
+      <section id="project-view" hidden>
+        <div class="section-heading"><h2>Algorithms and environments</h2><span id="catalog-status" class="muted">Scanning source...</span></div>
+        <div id="catalog-summary" class="catalog-summary"></div><div id="catalog-entries" class="catalog-entries"></div>
+        <div class="section-heading"><h2>Output locations</h2><div class="actions"><label class="check"><input id="use-llm" type="checkbox">LLM analysis</label><button id="configure-llm" class="secondary"><i data-lucide="settings-2"></i>Configure AI</button><button id="analyze" class="secondary"><i data-lucide="scan-search"></i>Analyze</button></div></div>
+        <div id="analysis-status" class="muted">Not analyzed</div>
+        <div class="section-heading"><h2>Training history</h2><span class="muted">Harness metadata for the project output location</span></div><div id="project-output-history" class="presets"></div>
+        <div id="candidates" class="candidates"></div>
+        <div class="section-heading"><h2>Project commands</h2></div><div id="presets" class="presets"></div>
+        <div class="section-heading"><h2>Workspace</h2></div><dl class="metadata-grid"><dt>Metadata directory</dt><dd id="metadata-root" class="mono"></dd><dt>Python</dt><dd id="python-path" class="mono"></dd></dl>
+      </section>
+    </div>
+  </main>
+  <dialog id="project-dialog"><form id="project-form"><div class="dialog-heading"><h2>Add project</h2><button type="button" class="icon close" aria-label="Close" title="Close"><i data-lucide="x"></i></button></div><label>Project name<input name="name" placeholder="Project name"></label><label>Local directory<input name="path" required placeholder="/absolute/path/to/project"></label><div class="directory-browser"><div class="browser-toolbar"><button type="button" class="secondary" id="browse-up"><i data-lucide="arrow-up"></i>Parent</button><span id="browse-current" class="mono muted"></span></div><div id="browse-list" class="browse-list"></div></div><div class="form-error" role="alert"></div><footer><button type="button" class="secondary close">Cancel</button><button class="primary" type="submit"><i data-lucide="folder-plus"></i>Add project</button></footer></form></dialog>
+  <dialog id="run-dialog"><form id="run-form"><div class="dialog-heading"><h2>New execution</h2><button type="button" class="icon close" aria-label="Close" title="Close"><i data-lucide="x"></i></button></div><div class="form-grid"><label>Task<select name="task" id="task-select"><option>train</option><option>evaluate</option></select></label><label>Python environment<select name="python" id="python-select" required></select></label><label>Repeats<input name="repeats" type="number" min="1" max="20" value="1" required></label><label class="check"><input name="auto_install" type="checkbox" checked>Install declared missing dependencies</label></div><label>Working directory<input name="working_directory" class="mono" required></label><div id="environment-status" class="runtime-status" role="status">Checking selected environment...</div><label>Command<textarea name="command" rows="4" required spellcheck="false" class="mono"></textarea></label><label>Environment ID<input name="environment" list="known-environments" placeholder="Optional CLI value"><datalist id="known-environments"></datalist></label><label>Seeds<input name="seeds" placeholder="1, 2, 3" value="1"></label><label>Output location override<input name="output" placeholder="Automatic detection" class="mono"></label><details><summary>Environment variables</summary><label>Variables<textarea name="environment_vars" rows="3" class="mono" spellcheck="false">{}</textarea></label></details><div class="command-preview" id="command-preview"></div><div class="form-error" role="alert"></div><footer><button type="button" class="secondary close">Cancel</button><button class="primary" type="submit"><i data-lucide="play"></i>Start execution</button></footer></form></dialog>
+  <dialog id="detail-dialog"><div class="dialog-heading"><h2>Execution details</h2><button type="button" class="icon close" aria-label="Close" title="Close"><i data-lucide="x"></i></button></div><div id="execution-detail"></div></dialog>
+  <dialog id="llm-dialog">
+    <form id="llm-form">
+      <div class="dialog-heading"><h2>AI connection</h2><button type="button" class="icon close" aria-label="Close" title="Close"><i data-lucide="x"></i></button></div>
+      <label>API protocol<select name="provider"><option value="openai-compatible">Chat Completions compatible</option><option value="custom">Custom Chat Completions endpoint</option></select></label>
+      <label>Base URL or full endpoint<input name="base_url" required type="url" placeholder="https://api.example.com/v1"></label>
+      <label>Model<input name="model" required placeholder="Model ID"></label>
+      <label>API key<input name="api_key" type="password" autocomplete="off" placeholder="Leave blank to keep the saved key"></label>
+      <label class="check"><input name="clear_api_key" type="checkbox">Clear saved key</label>
+      <label>Request timeout (seconds)<input name="timeout_seconds" type="number" min="5" max="180" value="45" required></label>
+      <dl class="metadata-grid"><dt>Analysis scope</dt><dd>Output locations</dd><dt>Source access</dt><dd>Read-only / 100 files / 100,000 characters</dd><dt>Model tools</dt><dd>None</dd><dt>File writes</dt><dd>Disabled</dd></dl>
+      <div id="llm-config-status" class="muted" role="status"></div><div class="form-error" role="alert"></div>
+      <footer><button type="button" class="secondary" id="test-llm"><i data-lucide="plug-zap"></i>Test connection</button><button type="button" class="secondary close">Cancel</button><button class="primary" type="submit"><i data-lucide="save"></i>Save configuration</button></footer>
+    </form>
+  </dialog>
+  <div id="toast" role="status" hidden></div>
+</body>
+</html>

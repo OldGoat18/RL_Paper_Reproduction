@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=61,<80"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,10 +8,14 @@ version = "0.1.0"
 description = "Execution metadata and output-location detection for RL reproductions"
 readme = "README.md"
 requires-python = ">=3.9"
-authors = [{name = "RL Reproduction"]]
+dependencies = ["PyYAML>=6,<7", "tomli>=2; python_version<'3.11'", "packaging>=21"]
+authors = [{name = "RL Reproduction"}]
 
 [project.scripts]
 rl-harness = "rl_repro_harness.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["rl_repro_harness*"]
+
+[tool.setuptools.package-data]
+rl_repro_harness = ["static/*"]

@@ -110,8 +110,8 @@ function renderProject() {
   }).join('');
   $('#analyze').disabled = !p || analyzing;
   $('#analyze-project').disabled = !p || analyzing;
-  $('#use-llm').disabled = !state.llm_available;
-  $('#use-llm').checked = state.llm_available && (llmChoice ?? true);
+  $('#use-llm').disabled = true;
+  $('#use-llm').checked = true;
   $('#use-llm').title = state.llm_available ? 'LLM analysis' : 'LLM service not configured';
   if (state.llm_error) $('#use-llm').title = state.llm_error;
   $('#configure-llm').innerHTML = `${icon('settings-2')}${state.llm_available ? 'AI settings' : 'Configure AI'}`;
@@ -123,7 +123,7 @@ function renderProject() {
   }
   const report=p?.analysis;
   const openReports = new Set($$('#analysis-report details[open]').map(d=>d.querySelector('summary').textContent));
-  $('#analysis-report').innerHTML=report ? (report.catalog.subprojects || []).map(s=>'<details class="analysis-subproject"><summary>'+escapeHtml(s.name)+' / '+escapeHtml(s.dependency_status || 'unscanned')+' / '+s.files_scanned+' source files</summary><p class="mono">'+escapeHtml(s.path)+'</p><pre>'+escapeHtml(s.dependency_error || JSON.stringify({files:s.dependencies?.dependency_files,requirements:s.dependencies?.requirements,options:s.dependencies?.pip_options,warnings:s.warnings,limits:s.limits},null,2))+'</pre></details>').join('') : '';
+  $('#analysis-report').innerHTML=report ? (report.catalog.entries || []).map(e=>'<details class="analysis-subproject"><summary>'+escapeHtml(e.path)+'</summary><pre>'+escapeHtml(JSON.stringify({runtime:e.runtime,resources:e.resources,recovery:e.recovery || 'Unconfirmed',evidence:e.evidence},null,2))+'</pre></details>').join('') + (report.catalog.uncertainties || []).map(s=>'<p class="runtime-status pending">'+escapeHtml(s)+'</p>').join('') : '';
   $$('#analysis-report details').forEach(d=>d.open=openReports.has(d.querySelector('summary').textContent));
   $('#analysis-status').textContent = analyzing ? 'Analyzing...' : analysisError || (detection ? `${detection.method === 'llm' ? 'LLM' : 'Static'} analysis / ${detection.confidence} confidence` : 'Not analyzed');
   $('#candidates').innerHTML = detection?.candidates?.length ? detection.candidates.map(c => `<div class="candidate"><strong class="mono">${escapeHtml(c.path)}</strong><span>${escapeHtml(c.source)} <span class="badge">${escapeHtml(c.confidence)}</span></span><code>${escapeHtml(c.evidence)}</code></div>`).join('') : '<div class="muted">No confirmed output locations</div>';
@@ -135,6 +135,12 @@ function renderProject() {
 }
 function renderResources() {
   const resources=state.resources||{};
+  ensureResourcePolicy();
+  const policyForm=$('#resource-policy');
+  if (!policyForm.contains(document.activeElement) && !policyForm.dataset.dirty) {
+    Object.entries(resources.policy || {}).forEach(([key,value])=>{if(policyForm.elements[key])policyForm.elements[key].value=value;});
+  }
+  $('#resource-gpus').textContent=(resources.gpus || []).map(g=>`${g.name} / GPU ${g.id}: ${g.free_mb} MB free of ${g.total_mb} MB / ${g.utilization}%`).join('\n') || 'No NVIDIA GPU reported';
   const cpu=Number(resources.cpu_percent); const memory=Number(resources.memory_percent);
   $('#resource-cpu').textContent=Number.isFinite(cpu)?`${cpu.toFixed(1)}%`:'Unavailable';
   $('#resource-memory').textContent=Number.isFinite(memory)?`${memory.toFixed(1)}%`:'Unavailable';
@@ -150,7 +156,6 @@ async function openLLMConfig() {
   const config = await api('llm/config');
   const form = $('#llm-form');
   form.reset();
-  form.elements.working_directory.value = project()?.path || '';
   form.elements.provider.value = config.provider === 'custom' ? 'custom' : 'openai-compatible';
   form.elements.base_url.value = config.base_url || '';
   form.elements.model.value = config.model || '';
@@ -194,16 +199,18 @@ async function openRun(task = 'train', entryId = null) {
   form.reset();
   if (!$('#entry-select')) {
     const config = document.createElement('div');
-    config.innerHTML = '<label>Entry point<select id="entry-select"></select></label><div class="form-grid"><label>Training steps<input name="steps" type="number" min="1" value="5000000" required></label><label class="check"><input name="start_immediately" type="checkbox" checked>Start when resources are available</label></div><div id="step-support" class="runtime-status"></div><div class="form-grid"><details class="tag-picker" open><summary>Algorithms</summary><div id="algorithm-select" class="selection-grid"></div></details><details class="tag-picker" open><summary>Environments</summary><div id="environment-select" class="selection-grid"></div></details></div>';
+    config.innerHTML = '<label>Entry point<select id="entry-select"></select></label><div class="form-grid"><label>Training steps<input name="steps" type="number" min="1" value="5000000" required></label><label class="check"><input name="start_immediately" type="checkbox" checked>Start when resources are available</label></div><div id="step-support" class="runtime-status"></div><div class="form-grid"><details class="tag-picker"><summary>Algorithms <span id="algorithm-count"></span></summary><div id="algorithm-select" class="selection-grid"></div><button type="button" class="secondary add-python" data-kind="algorithms">'+icon('file-plus')+'Add from Python file</button></details><details class="tag-picker"><summary>Environments <span id="environment-count"></span></summary><div id="environment-select" class="selection-grid"></div><button type="button" class="secondary add-python" data-kind="environments">'+icon('file-plus')+'Add from Python file</button></details></div>';
     form.elements.command.closest('label').before(config);
     $('#entry-select').addEventListener('change', () => configureEntry($('#entry-select').value));
     installSelectionTools('#algorithm-select');
     installSelectionTools('#environment-select');
+    $$('.add-python',config).forEach(button=>button.addEventListener('click',()=>openPythonPicker(button.dataset.kind)));
     const comparison = document.createElement('div');
     comparison.id = 'output-comparison'; comparison.className = 'runtime-status';
     $('#command-preview').before(comparison);
   }
   form.elements.environment.closest('label').hidden = true;
+  $$('.tag-picker',form).forEach(p=>p.open=false);
   $('#python-select').innerHTML = (state.python_environments || [{python:state.python,name:'current'}]).map(e=>'<option value="'+escapeHtml(e.python)+'">'+escapeHtml(e.name)+'</option>').join('');
   $('#python-select').value = project().runtime?.python || state.python;
   form.elements.task.value = task;
@@ -298,6 +305,10 @@ async function refreshEnvironmentStatus() {
   } catch (error) { status.className='runtime-status failed'; status.textContent=error.message; }
 }
 function preview() {
+  for(const name of ['algorithm','environment']) {
+    const count=$('#'+name+'-count');
+    if(count) count.textContent=$$('#'+name+'-select input:checked').length+' selected';
+  }
   clearTimeout(previewTimer);
   const version=++previewVersion;
   lastPlan=null;
@@ -306,11 +317,11 @@ function preview() {
       const plan=await api('command',runPayload());
       if(version!==previewVersion)return;
       lastPlan=plan;
-      if(document.activeElement!==$('#run-form').elements.command) $('#run-form').elements.command.value=plan.template;
+      if(document.activeElement!==$('#run-form').elements.command) $('#run-form').elements.command.value=plan.executions[0]?.display || plan.template;
       $('#command-preview').textContent=plan.executions.length+' executions\n'+plan.executions.slice(0,4).map(e=>e.display).join('\n')+(plan.executions.length>4?'\n...':'');
       const pairs=plan.completed_pairs || [];
       $('#output-comparison').className='runtime-status '+(pairs.length?'pending':'ready');
-      $('#output-comparison').textContent=pairs.length ? 'Previously completed combinations: '+pairs.map(p=>p.algorithm+' / '+p.environment+' / seed '+p.seed+' / steps '+(p.steps ?? 'unknown')).join('; ') : 'No completed matching algorithm/environment pairs in Harness records.';
+      $('#output-comparison').textContent=pairs.length ? pairs.map(p=>p.algorithm+' / '+p.environment+' / seed '+p.seed+' / '+p.action+' / '+p.message).join('\n') : 'No compatible training in execution records. Native training state is checked at start.';
       $('.form-error',$('#run-form')).textContent='';
     } catch(error) {
       if(version!==previewVersion)return;
@@ -322,6 +333,7 @@ function renderDetail(id) {
   const record = state.executions.find(r => r.execution_id === id);
   if (!record) return;
   const details = [['Execution ID',record.execution_id],['Project',record.project],['Status',record.status],['Task',record.task],['Seed / repeat',`${record.seed ?? '-'} / ${record.repeat ?? '-'}`],['Git commit',record.git_commit || 'Unavailable'],['Start',record.start_time],['End',record.end_time || '-'],['Exit code',record.exit_code ?? '-'],['Environment',JSON.stringify(record.environment)],['Confidence',record.output_path_confidence]];
+  details.push(['Training action',record.training_action || 'Pending preflight'],['Completed / target steps',`${record.completed_steps ?? 'Unknown'} / ${record.training_steps ?? 'Unknown'}`],['Remaining steps',record.remaining_steps ?? 'Unknown'],['Checkpoint',record.checkpoint || '-'],['Training decision',record.training_decision?.message || '-']);
   const control = record.status==='running' ? `<button class="secondary" data-pause="${escapeHtml(record.execution_id)}">${icon('pause')}Pause</button>` : record.status==='paused' ? `<button class="secondary" data-resume="${escapeHtml(record.execution_id)}">${icon('play')}Resume</button>` : record.status==='held' ? `<button class="secondary" data-start="${escapeHtml(record.execution_id)}">${icon('play')}Start</button>` : '';
   $('#execution-detail').innerHTML = `<dl class="metadata-grid">${details.map(([key,value])=>`<dt>${escapeHtml(key)}</dt><dd class="mono">${escapeHtml(value)}</dd>`).join('')}</dl><pre class="detail-command">${escapeHtml(JSON.stringify(record.command,null,2))}</pre>${record.error ? `<p class="form-error">${escapeHtml(record.error)}</p>`:''}<div class="detail-output"><h2>Output location</h2><p class="mono">${escapeHtml(outputPath(record) || 'Uncertain')}</p><div class="actions"><button class="secondary" data-copy="${escapeHtml(outputPath(record))}" ${outputPath(record)?'':'disabled'}>${icon('copy')}Copy path</button><button class="secondary" data-open="${escapeHtml(record.execution_id)}" ${outputPath(record)?'':'disabled'}>${icon('folder-open')}Open folder</button></div></div>${(record.output_candidates || []).map(c=>`<div class="candidate"><span class="mono">${escapeHtml(c.path)}</span><span>${escapeHtml(c.source)}</span></div>`).join('')}<footer>${control}<button class="secondary" data-retry="${escapeHtml(record.execution_id)}">${icon('rotate-ccw')}Rerun</button><button class="secondary" data-download="${escapeHtml(record.execution_id)}">${icon('download')}Metadata</button>${!['queued','preparing','running','paused'].includes(record.status) ? `<button class="secondary" data-delete="${escapeHtml(record.execution_id)}">${icon('trash-2')}Delete record</button>` : ''}</footer>`;
   if (record.stderr || record.stdout) {
@@ -338,7 +350,7 @@ async function analyze() {
   const buttons = [$('#analyze'),$('#analyze-project')];
   buttons.forEach(b=>{b.disabled=true;});
   $('#analysis-status').textContent = 'Analyzing...';
-  try { await api('analyze',{project_id:selected,llm:$('#use-llm').checked}); await refresh(); toast('Project analysis complete'); }
+  try { await api('analyze',{project_id:selected,llm:true}); await refresh(); toast('Project analysis complete'); }
   catch(error) { toast(error.message,true); analysisError = `Analysis failed: ${error.message}`; }
   finally { analyzing = false; renderProject(); }
 }
@@ -438,7 +450,6 @@ $('#run-form').addEventListener('submit',async event=>{
   try {
     const payload=runPayload();
     const plan=await api('command',payload);
-    if (plan.completed_pairs?.length && !confirm('These algorithm/environment pairs have completed runs. Create '+plan.executions.length+' executions again?')) return;
     const result=await api('launch',payload);
     $('#run-dialog').close();switchView('executions');filter='all';$$('[data-filter]').forEach(b=>{b.classList.toggle('selected',b.dataset.filter==='all');b.setAttribute('aria-selected',String(b.dataset.filter==='all'));});await refresh();toast(`${result.execution_ids.length} execution(s) queued`);
   }catch(error){$('.form-error',form).textContent=error.message;}finally{submit.disabled=false;}
@@ -473,6 +484,65 @@ document.addEventListener('click',async event=>{
     if(button.dataset.download){const r=state.executions.find(r=>r.execution_id===button.dataset.download);const url=URL.createObjectURL(new Blob([JSON.stringify(r,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=`execution-${r.execution_id}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
   }catch(error){toast(error.message,true);}
 });
+function ensureResourcePolicy() {
+  if($('#resource-policy'))return;
+  const form=document.createElement('form');form.id='resource-policy';
+  form.innerHTML='<h2>Resource policy</h2><div class="form-grid"><label>Maximum parallel executions<input name="max_parallel" type="number" min="1" max="32" required></label><label>CPU admission limit (%)<input name="cpu_limit" type="number" min="1" max="100" required></label><label>RAM reserve (MB)<input name="ram_reserve_mb" type="number" min="0" max="1048576" required></label><label>GPU memory reserve (MB)<input name="gpu_reserve_mb" type="number" min="0" max="1048576" required></label></div><button class="secondary" type="submit">'+icon('save')+'Save policy</button><div class="form-error" role="alert"></div><pre id="resource-gpus" class="runtime-status"></pre>';
+  $('.resource-grid').after(form);
+  form.addEventListener('input',()=>form.dataset.dirty='true');
+  form.addEventListener('submit',async event=>{event.preventDefault();const button=$('[type=submit]',form);button.disabled=true;
+    try{await api('resources/policy',Object.fromEntries([...new FormData(form)].map(([k,v])=>[k,Number(v)])));delete form.dataset.dirty;$('.form-error',form).textContent='';await refresh();toast('Resource policy saved');}
+    catch(error){$('.form-error',form).textContent=error.message;}finally{button.disabled=false;}
+  });
+}
+let pythonPickerContext=null;
+function openPythonPicker(kind) {
+  if(!$('#python-picker')) {
+    const dialog=document.createElement('dialog');dialog.id='python-picker';
+    dialog.innerHTML='<div class="dialog-heading"><h2>Add from Python file</h2><button type="button" class="icon" id="python-picker-close" aria-label="Close" title="Close">'+icon('x')+'</button></div><div class="browser-toolbar"><button type="button" class="icon" id="python-picker-up" title="Parent folder" aria-label="Parent folder">'+icon('arrow-up')+'</button><span id="python-picker-path" class="mono"></span></div><div id="python-picker-list" class="browse-list"></div><p id="python-picker-status" role="status"></p><div class="form-error" role="alert"></div>';
+    document.body.append(dialog);
+    $('#python-picker-close').addEventListener('click',()=>dialog.close());
+    $('#python-picker-up').addEventListener('click',()=>browsePython($('#python-picker-up').dataset.parent));
+    $('#python-picker-list').addEventListener('click',async event=>{
+      const button=event.target.closest('button');if(!button)return;
+      if(button.dataset.directory)return browsePython(button.dataset.directory);
+      if(!button.dataset.file)return;
+      const context={...pythonPickerContext};
+      $$('#python-picker button').forEach(b=>b.disabled=true);$('#python-picker-status').textContent='AI is analyzing '+button.textContent+'...';
+      try{
+        const result=await api('analyze-file',{project_id:context.projectId,entry_id:context.entryId,kind:context.kind,path:button.dataset.file});
+        if(selected!==context.projectId)throw new Error('Project changed; reopen New execution to use the new candidates');
+        const previous={algorithms:$$('#algorithm-select input:checked').map(i=>i.value),environments:$$('#environment-select input:checked').map(i=>i.value)};
+        catalog=result.catalog;
+        $('#entry-select').innerHTML=catalog.entries.map(e=>'<option value="'+escapeHtml(e.id)+'">'+escapeHtml(e.project_name+' / '+e.path)+'</option>').join('');
+        const target=result.entry_ids.includes(context.entryId)?context.entryId:result.entry_ids[0] || context.entryId;
+        $('#entry-select').value=target;
+        if(target!==context.entryId)configureEntry(target);
+        else {
+          runEntry=catalog.entries.find(e=>e.id===target);
+          for(const [key,selector] of [['algorithms','#algorithm-select'],['environments','#environment-select']]){
+            const choices=new Set([...previous[key],...(key===context.kind?result.added:[])]);
+            $(selector).innerHTML=runEntry[key].map(value=>'<label class="tag-option"><input type="checkbox" value="'+escapeHtml(value)+'" '+(choices.has(value)?'checked':'')+'><span>'+escapeHtml(value)+'</span></label>').join('');
+          }
+        }
+        preview();dialog.close();toast(result.added.length?result.added.length+' candidate(s) available':result.uncertainties.join('; ') || 'No evidenced candidates found');
+        const picker=$(context.kind==='algorithms'?'#algorithm-select':'#environment-select').closest('details');picker.open=true;
+      }catch(error){$('.form-error',dialog).textContent=error.message;}
+      finally{$$('#python-picker button').forEach(b=>b.disabled=false);$('#python-picker-up').disabled=!$('#python-picker-up').dataset.parent;$('#python-picker-status').textContent='';}
+    });
+  }
+  pythonPickerContext={kind,projectId:selected,entryId:$('#run-form').dataset.entryId};
+  $('#python-picker').showModal();browsePython(project().path);
+}
+async function browsePython(path) {
+  const dialog=$('#python-picker');$('.form-error',dialog).textContent='';
+  $('#python-picker-list').textContent='Loading...';
+  try{
+    const result=await api('browse?kind=python&project_id='+encodeURIComponent(pythonPickerContext.projectId)+'&path='+encodeURIComponent(path));
+    $('#python-picker-path').textContent=result.path;$('#python-picker-up').dataset.parent=result.parent || '';$('#python-picker-up').disabled=!result.parent;
+    $('#python-picker-list').innerHTML=result.entries.map(e=>'<button type="button" class="browse-entry" data-'+(e.kind==='file'?'file':'directory')+'="'+escapeHtml(e.path)+'">'+icon(e.kind==='file'?'file-code':'folder')+'<span>'+escapeHtml(e.name)+'</span></button>').join('') || '<p class="muted">No folders or Python files</p>';icons();
+  }catch(error){$('#python-picker-list').textContent='';$('.form-error',dialog).textContent=error.message;}
+}
 refresh().catch(error=>toast(error.message,true));
 ensureBulkDelete();
 setInterval(()=>refresh().catch(()=>{}),3000);

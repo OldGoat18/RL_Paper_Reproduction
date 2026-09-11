@@ -83,10 +83,12 @@ def build_commands(data):
         step_flag = data.get('steps_flag') or (found[0] if found else next((f for f in STEP_FLAGS if f in flags), None))
         if not step_flag:
             raise ValueError('Training step argument is unconfirmed for this entry point')
-        if step_flag not in STEP_FLAGS:
+        if step_flag not in STEP_FLAGS and step_flag not in flags:
             raise ValueError('Unsupported training step flag')
-        argv = replace_option(argv, STEP_FLAGS, step_flag, str(steps))
+        argv = replace_option(argv, (*STEP_FLAGS, step_flag), step_flag, str(steps))
     for (name, aliases), placeholder in zip(ALIASES.items(), placeholders):
+        binding = data.get('bindings', {}).get(name)
+        aliases = (*aliases, binding) if binding else aliases
         values = selections.get(name, [])
         if not isinstance(values, list) or len(values) > 64:
             raise ValueError('Invalid selection list')

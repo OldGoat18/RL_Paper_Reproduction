@@ -77,7 +77,7 @@ class ExecutionTests(unittest.TestCase):
             finally:
                 first.close()
 
-    def test_catalog_lists_algorithms_environments_and_runnable_scripts(self):
+    def test_catalog_requires_ai_instead_of_implicit_source_discovery(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "train.py").write_text("import gym\nparser.add_argument('--alg'); env='SafetyBallCircle-v0'\nif __name__ == '__main__': pass\n")
@@ -85,9 +85,10 @@ class ExecutionTests(unittest.TestCase):
             try:
                 project = workspace.register(root)
                 catalog = workspace.catalog(project["id"])
-                self.assertIn("train.py", [entry["path"] for entry in catalog["entries"]])
-                self.assertIn("SafetyBallCircle-v0", catalog["environments"])
-                self.assertIn("train", catalog["entries"][0]["path"])
+                self.assertEqual(catalog['origin'], 'pending_ai')
+                self.assertEqual(catalog['entries'], [])
+                with self.assertRaisesRegex(ValueError, 'Configure an LLM'):
+                    workspace.analyze(project['id'])
             finally:
                 workspace.close()
 

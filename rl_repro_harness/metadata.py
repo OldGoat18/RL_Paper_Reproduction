@@ -38,6 +38,13 @@ class ExecutionMetadata:
     algorithm: Optional[str] = None
     rl_environment: Optional[str] = None
     training_steps: Optional[int] = None
+    configuration_key: Optional[str] = None
+    training_contract: dict[str, Any] = field(default_factory=dict)
+    training_action: Optional[str] = None
+    training_decision: dict[str, Any] = field(default_factory=dict)
+    completed_steps: Optional[int] = None
+    remaining_steps: Optional[int] = None
+    checkpoint: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

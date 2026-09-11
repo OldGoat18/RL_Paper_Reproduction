@@ -83,15 +83,20 @@ def make_server(workspace, host="127.0.0.1", port=8765):
                     return self.send(400, {"error": str(exc)})
             if path == "/api/browse":
                 try:
-                    requested = parse_qs(urlsplit(self.path).query).get("path", [str(Path.cwd())])[0]
+                    query = parse_qs(urlsplit(self.path).query)
+                    python_picker = query.get('kind', [''])[0] == 'python'
+                    root = Path(workspace.project(query.get('project_id', [''])[0])['path']) if python_picker else None
+                    requested = query.get("path", [str(root or Path.cwd())])[0]
                     directory = Path(requested).expanduser().resolve()
                     if not directory.is_dir():
                         raise ValueError("Directory does not exist")
+                    if root and directory != root and root not in directory.parents:
+                        raise ValueError('File picker must stay inside Project Root')
                     entries = []
                     for child in sorted(directory.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
-                        if child.is_dir() and not child.is_symlink() and not child.name.startswith("."):
-                            entries.append({"name": child.name, "path": str(child)})
-                    parent = str(directory.parent) if directory != directory.parent else None
+                        if not child.is_symlink() and not child.name.startswith(".") and (child.is_dir() or python_picker and child.suffix == '.py' and child.is_file()):
+                            entries.append({"name": child.name, "path": str(child), 'kind': 'directory' if child.is_dir() else 'file'})
+                    parent = str(directory.parent) if directory != directory.parent and directory != root else None
                     return self.send(200, {"path": str(directory), "parent": parent, "entries": entries})
                 except (ValueError, OSError) as exc:
                     return self.send(400, {"error": str(exc)})
@@ -128,8 +133,13 @@ def make_server(workspace, host="127.0.0.1", port=8765):
                     result = workspace.test_llm(data or None)
                 elif path == "/api/analyze":
                     result = workspace.analyze(data["project_id"], data.get("command", ""), data.get("llm", False))
+                elif path == '/api/analyze-file':
+                    result = workspace.analyze_file(data['project_id'], data['path'], data['kind'], data.get('entry_id'))
+                elif path == '/api/resources/policy':
+                    result = workspace.configure_resources(data)
                 elif path == "/api/launch":
-                    result = {"execution_ids": workspace.launch(data)}
+                    ids = workspace.launch(data)
+                    result = {"execution_ids": ids, 'executions': [workspace.record(i) for i in ids]}
                 elif path == '/api/command':
                     result = describe_command(data['command']) if data.get('describe') else (workspace.command_plan(data) if data.get('project_id') else build_commands(data))
                 elif path == "/api/cancel":

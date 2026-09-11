@@ -32,7 +32,12 @@ class LLMIntegrationTests(unittest.TestCase):
                 owner.requests.append((self.path, dict(self.headers), body))
                 content = owner.reply
                 if content is None:
-                    content = {"ok": True} if body['max_tokens'] == 50 else {"candidates": [{"path": "./native", "source": "README.md", "evidence": "Output path: ./native", "confidence": "high"}]}
+                    payload = json.loads(body['messages'][1]['content'])
+                    outputs = [{"path": "./native", "source": "README.md", "evidence": "Output path: ./native", "confidence": "high"}]
+                    if payload.get('scope') == 'project':
+                        content = {'read_files': ['README.md']} if not payload['sources'] else {'entries': [], 'outputs': outputs, 'uncertainties': []}
+                    else:
+                        content = {"ok": True} if body['max_tokens'] == 50 else {"candidates": outputs}
                 result = {"choices": [{"message": {"content": json.dumps(content)}, "finish_reason": "stop"}]}
                 data = json.dumps(result).encode()
                 self.send_response(200)
@@ -82,7 +87,7 @@ class LLMIntegrationTests(unittest.TestCase):
         body = self.requests[-1][2]
         self.assertNotIn('tools', body)
         self.assertNotIn('functions', body)
-        self.assertLessEqual(sum(map(len, json.loads(body['messages'][1]['content']).values())), 100000)
+        self.assertLessEqual(sum(map(len, json.loads(body['messages'][1]['content'])['sources'].values())), 100000)
         self.assertEqual(before, {p.relative_to(self.project): p.read_bytes() for p in self.project.rglob('*') if p.is_file()})
         self.assertFalse((self.project / 'extra.py').exists())
         self.assertFalse(self.workspace.records())

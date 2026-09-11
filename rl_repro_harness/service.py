@@ -19,9 +19,10 @@ from pathlib import Path
 from .detector import detect_output_paths
 from .commands import build_commands
 from .metadata import ExecutionMetadata
-from .discovery import discover, LIMITS
+from .analysis import analyze_project, analyze_python_file, validate_command, LIMITS
+from .training import configuration_key, decision, apply_decision
 from .llm import detect_with_llm, load_config, save_config, test_connection, validate_config
-from .runner import _now, execute_execution, prepare_execution
+from .runner import _now, _git_commit, execute_execution, prepare_execution
 from .environment import conda_environments, current_python, dependency_root, inspect_environment, prepare_environment, python_path, MANIFESTS
 
 
@@ -40,7 +41,12 @@ class Workspace:
                 raise ValueError("Another Web server is using this metadata directory") from exc
         self.lock = threading.RLock()
         self.max_parallel = max(1, min(4, (os.cpu_count() or 2) // 2))
-        self.pool = ThreadPoolExecutor(max_workers=self.max_parallel, thread_name_prefix="rl-execution")
+        self.policy = {'max_parallel': self.max_parallel, 'cpu_limit': 90, 'ram_reserve_mb': 1024, 'gpu_reserve_mb': 512}
+        policy_file = self.root / 'resource-policy.json'
+        if policy_file.exists():
+            self.policy.update(json.loads(policy_file.read_text()))
+            self.max_parallel = self.policy['max_parallel']
+        self.pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="rl-execution")
         self.environment_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rl-environment")
         self.jobs = {}
         self.environment_jobs = {}
@@ -49,6 +55,10 @@ class Workspace:
         self.held = set()
         self.held_events = {}
         self.reserved_slots = 0
+        self.training_claims = set()
+        self.allocations = {}
+        self.gpu_snapshot = []
+        self.gpu_snapshot_time = 0
         self.python_environments = conda_environments()
         self.registry = self.root / "projects.json"
         self.projects = json.loads(self.registry.read_text()) if self.registry.exists() else []
@@ -73,8 +83,6 @@ class Workspace:
         with self.lock:
             existing = next((p for p in self.projects if p["path"] == str(path)), None)
             if existing:
-                if "runtime" not in existing:
-                    self.prepare_project_environment(existing['id'])
                 return existing
             project = {"id": uuid.uuid4().hex, "name": (name or path.name)[:120], "path": str(path), "created_at": _now(), "detection": None}
             manifest = path / "harness.project.json"
@@ -84,7 +92,6 @@ class Workspace:
                 project["name"] = name or spec.get("name", path.name)
             self.projects.append(project)
             self._write(self.registry, self.projects)
-            self.prepare_project_environment(project['id'])
             return project
 
     def project(self, project_id):
@@ -97,7 +104,7 @@ class Workspace:
     def catalog(self, project_id):
         project = self.project(project_id)
         cached = project.get('analysis', {}).get('catalog')
-        return cached or {**discover(project['path']), 'project_id': project_id}
+        return cached if cached and cached.get('origin') == 'llm' else {'entries': [], 'algorithms': [], 'environments': [], 'subprojects': [], 'project_id': project_id, 'origin': 'pending_ai'}
 
     def defaults(self, project_id):
         """Return only defaults backed by project-authored evidence."""
@@ -112,27 +119,58 @@ class Workspace:
             directory = str(Path(project["path"]) / entry["directory"])
         environment = (entry.get("environments") or [None])[0] if entry else None
         seed_default = (entry.get("defaults") or {}).get("--seed", "") if entry else ""
-        detection = detect_output_paths(project["path"], shlex.split(command.replace("{python}", sys.executable)) if command else ())
-        return {"project_id": project_id, "task": "train", "command": command.replace("{python}", sys.executable) if command else "", "working_directory": directory, "environment": environment or "", "seeds": ", ".join(map(str, range(30))), "steps": 5000000, "entry_id": entry["id"] if entry else None, "repeats": "1", "output": detection.detected_output_path or "", "source": "project preset" if preset else (entry.get("source") if entry else None), "confidence": "high" if command else "uncertain"}
+        return {"project_id": project_id, "task": "train", "command": command.replace("{python}", sys.executable) if command else "", "working_directory": directory, "environment": environment or "", "seeds": ", ".join(map(str, range(30))), "steps": 5000000, "entry_id": entry["id"] if entry else None, "repeats": "1", "output": (project.get('detection') or {}).get('detected_output_path') or "", "source": "project preset" if preset else (entry.get("source") if entry else None), "confidence": "high" if command else "uncertain"}
 
     def analyze(self, project_id, command="", llm=False):
         project = self.project(project_id)
-        catalog = {**discover(project["path"], include_dependencies=True), "project_id": project_id}
+        config = load_config(self.root)
+        if config is None:
+            raise ValueError("Configure an LLM provider before project analysis")
+        catalog = {**analyze_project(project['path'], config), 'project_id': project_id}
+        outputs = catalog['outputs']
+        paths = {item['path'] for item in outputs if item['confidence'] != 'uncertain'}
+        path = next(iter(paths)) if len(paths) == 1 and all(i['confidence'] != 'uncertain' for i in outputs) else None
+        result = {'project_path': project['path'], 'candidates': outputs, 'detected_output_path': path,
+                  'confidence': 'high' if path else 'uncertain', 'method': 'llm'}
         with self.lock:
-            project["analysis"] = {"catalog": catalog, "limits": LIMITS, "analyzed_at": _now()}
-            self._write(self.registry, self.projects)
-        argv = shlex.split(command) if isinstance(command, str) else command
-        if llm:
-            config = load_config(self.root)
-            if config is None:
-                raise ValueError("Configure an LLM provider before LLM analysis")
-            result = detect_with_llm(project["path"], argv, config=config).to_dict()
-        else:
-            result = detect_output_paths(project["path"], argv).to_dict()
-        with self.lock:
+            project['analysis'] = {'catalog': catalog, 'limits': LIMITS, 'analyzed_at': _now()}
             project["detection"] = result
             self._write(self.registry, self.projects)
         return {**result, "analysis": project["analysis"]}
+
+    def analyze_file(self, project_id, path, kind, entry_id):
+        if kind not in {'algorithms', 'environments'}:
+            raise ValueError('Choose algorithms or environments')
+        project = self.project(project_id)
+        config = load_config(self.root)
+        if not config:
+            raise ValueError('Configure an LLM provider first')
+        catalog = self.catalog(project_id)
+        existing = next((e for e in catalog['entries'] if e['id'] == entry_id), None)
+        result = analyze_python_file(project['path'], config, path, kind, catalog, entry_id)
+        with self.lock:
+            current = self.catalog(project_id)
+            entries = {e['id']: e for e in current['entries']}
+            added = []
+            for entry in result['entries']:
+                prior = entries.get(entry['id'])
+                if prior:
+                    # Supplemental evidence may extend choices, but cannot silently rewrite the original command.
+                    for key in ('command', 'directory', 'bindings', 'steps_flag', 'runtime', 'recovery'):
+                        if entry[key] != prior[key]:
+                            raise ValueError('Supplemental analysis changed the existing execution contract; run full project analysis')
+                    for key in ('algorithms', 'environments', 'flags'):
+                        entry[key] = sorted(set(prior[key] + entry[key]))
+                    entry['environment_arguments'] = {**prior['environment_arguments'], **entry['environment_arguments']}
+                    entry['source_hashes'] = {**prior['source_hashes'], **entry['source_hashes']}
+                entries[entry['id']] = entry
+                added.extend(entry[kind])
+            updated = {**current, 'origin': 'llm', 'entries': list(entries.values())}
+            for key in ('algorithms', 'environments'):
+                updated[key] = sorted({v for e in entries.values() for v in e[key]})
+            project['analysis'] = {**project.get('analysis', {}), 'catalog': updated, 'analyzed_at': _now(), 'limits': LIMITS}
+            self._write(self.registry, self.projects)
+        return {'catalog': updated, 'added': sorted(set(added)), 'entry_ids': [e['id'] for e in result['entries']], 'uncertainties': result['uncertainties']}
 
     def command_plan(self, data):
         payload = dict(data)
@@ -145,28 +183,51 @@ class Workspace:
                     raise ValueError('Unsupported ' + key + ' for this entry point')
             payload.update({key: entry[key] for key in ('bindings', 'environment_arguments', 'steps_flag', 'flags')})
             payload['fixed_environment'] = len(entry['environments']) == 1 and not entry['bindings']['environments']
+            root = Path(self.project(data['project_id'])['path'])
+            directory = self._working_directory(self.project(data['project_id']), data.get('working_directory'))
+            if directory != (root / entry['directory']).resolve():
+                raise ValueError('Working directory must match the AI execution plan')
+            argv = validate_command(root, directory, data['command'], root / entry['path'])
+            allowed = set(entry['flags'])
+            for arg in argv[2:]:
+                if arg.startswith('--') and arg.partition('=')[0] not in allowed:
+                    raise ValueError('Command contains an argument outside the AI execution plan: ' + arg)
+            if entry['environments'] and not data.get('selections', {}).get('environments'):
+                raise ValueError('Select at least one environment')
+            if entry['algorithms'] and not data.get('selections', {}).get('algorithms'):
+                raise ValueError('Select at least one algorithm')
+        elif data.get('selections'):
+            raise ValueError('Select an AI-analyzed entry point first')
         plan = build_commands(payload)
         project = self.project(data['project_id'])
         directory = str(self._working_directory(project, data.get('working_directory')))
-        history = [r for r in self.records() if r.get('project') == project['path'] and r.get('status') == 'success'
-                   and r.get('task') == data.get('task', 'train')
-                   and str(Path(r.get('working_directory') or r['project']).resolve()) == directory]
-        from .commands import describe_command, option
+        history = self.records()
+        commit = _git_commit(Path(project['path']))
         completed = []
         for execution in plan['executions']:
-            for record in history:
-                description = describe_command(record.get('command', []))
-                algorithm = record.get('algorithm') or next(iter(description['algorithms']), None)
-                environment = record.get('rl_environment') or next(iter(description['environments']), None)
-                domain = option(record.get('command', []), ('--domain',))
-                task = option(record.get('command', []), ('--task',))
-                if not environment and domain and task:
-                    environment = domain[1] + '/' + task[1]
-                if (algorithm, environment) == (execution['algorithm'], execution['rl_environment']) and algorithm and environment:
-                    completed.append({'algorithm': algorithm, 'environment': environment, 'seed': record.get('seed'),
-                                      'steps': record.get('training_steps'), 'execution_id': record['execution_id']})
-        plan['completed_pairs'] = list({r['execution_id']: r for r in completed}.values())
+            metadata = self._plan_metadata(project, execution, data, entry if data.get('entry_id') else {}, commit)
+            check = decision(metadata, history, probe=False)
+            execution['training_decision'] = check
+            if check['action'] != 'new_run':
+                completed.append({'algorithm': execution['algorithm'], 'environment': execution['rl_environment'],
+                                  'seed': execution['seed'], 'steps': check['completed_steps'], 'action': check['action'], 'message': check['message']})
+        plan['completed_pairs'] = completed
         return plan
+
+    def _plan_metadata(self, project, execution, data, contract, commit):
+        detection = project.get('detection') or {}
+        metadata = ExecutionMetadata(execution_id=uuid.uuid4().hex, project=project['path'], git_commit=commit,
+            task=data.get('task', 'train'), environment={}, command=list(execution['command']), seed=execution['seed'],
+            repeat=execution['repeat'], start_time=_now(), end_time=None, exit_code=None, status='queued',
+            detected_output_path=execution.get('output') or detection.get('detected_output_path'),
+            output_path_confidence='override' if execution.get('output') else detection.get('confidence', 'uncertain'),
+            output_candidates=detection.get('candidates', []), working_directory=str(self._working_directory(project, data.get('working_directory'))),
+            algorithm=execution.get('algorithm'), rl_environment=execution.get('rl_environment'), training_steps=execution.get('steps'),
+            training_contract=contract, launch_environment=dict(data.get('environment') or {}), resource_request=contract.get('resources', {}))
+        if data.get('python'):
+            metadata.command[0] = python_path(data['python'])
+        metadata.configuration_key = configuration_key(metadata, contract)
+        return metadata
 
     def records(self):
         records = []
@@ -218,18 +279,87 @@ class Workspace:
         return {"projects": self.projects, "executions": self.records(), "llm_available": config is not None, "llm": config.public_dict() if config else None, "llm_error": config_error, "python": current_python(), "python_environments": self.python_environments, "metadata_root": str(self.root), "working_directory": str(Path.cwd()), "resources": self.resources()}
 
     def resources(self):
+        if time.monotonic() - self.gpu_snapshot_time > 5:
+            self.gpu_snapshot_time = time.monotonic()
+            try:
+                import csv
+                result = subprocess.run(['nvidia-smi', '--query-gpu=index,name,memory.free,memory.total,utilization.gpu', '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=2)
+                self.gpu_snapshot = [{'id': row[0].strip(), 'name': row[1].strip(), 'free_mb': int(row[2]), 'total_mb': int(row[3]), 'utilization': int(row[4])} for row in csv.reader(result.stdout.splitlines())] if result.returncode == 0 else []
+            except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+                self.gpu_snapshot = []
+        extra = {'gpus': self.gpu_snapshot, 'policy': dict(self.policy)}
         try:
             import psutil
             memory = psutil.virtual_memory()
-            return {'cpu_percent': psutil.cpu_percent(interval=None), 'cpu_count': psutil.cpu_count() or 1,
+            return {**extra, 'cpu_percent': psutil.cpu_percent(interval=None), 'cpu_count': psutil.cpu_count() or 1,
                     'memory_percent': memory.percent, 'memory_available_bytes': memory.available,
                     'memory_total_bytes': memory.total, 'parallel_limit': self.max_parallel,
                     'running': self.reserved_slots, 'active': len(self.jobs) + len(self.held)}
         except ImportError:
             load = os.getloadavg()[0] if hasattr(os, 'getloadavg') else 0
-            return {'cpu_percent': round(load * 100 / max(os.cpu_count() or 1, 1), 1), 'cpu_count': os.cpu_count() or 1,
-                    'memory_percent': None, 'memory_available_bytes': None, 'memory_total_bytes': None,
+            memory = {}
+            try:
+                for line in Path('/proc/meminfo').read_text().splitlines():
+                    key, value = line.split(':', 1)
+                    memory[key] = int(value.split()[0]) * 1024
+            except (OSError, ValueError):
+                pass
+            total, available = memory.get('MemTotal'), memory.get('MemAvailable')
+            return {**extra, 'cpu_percent': round(load * 100 / max(os.cpu_count() or 1, 1), 1), 'cpu_count': os.cpu_count() or 1,
+                    'memory_percent': 100 * (1 - available / total) if total and available else None, 'memory_available_bytes': available, 'memory_total_bytes': total,
                     'parallel_limit': self.max_parallel, 'running': self.reserved_slots, 'active': len(self.jobs) + len(self.held)}
+
+    def configure_resources(self, data):
+        bounds = {'max_parallel': (1, 32), 'cpu_limit': (1, 100), 'ram_reserve_mb': (0, 1048576), 'gpu_reserve_mb': (0, 1048576)}
+        if set(data) != set(bounds) or any(type(data[k]) is not int or not low <= data[k] <= high for k, (low, high) in bounds.items()):
+            raise ValueError('Invalid resource policy; parallel limit must be 1..32 and CPU limit 1..100')
+        with self.lock:
+            self.policy = dict(data)
+            self.max_parallel = data['max_parallel']
+            self._write(self.root / 'resource-policy.json', self.policy)
+        return self.resources()
+
+    def _allocation(self, metadata, snapshot):
+        request = {'cpu_cores': 1, 'ram_mb': 512, 'gpu_memory_mb': 0, **metadata.resource_request}
+        used_cpu = sum(r['cpu_cores'] for r in self.allocations.values())
+        if used_cpu + request['cpu_cores'] > snapshot['cpu_count']:
+            return None
+        available = snapshot.get('memory_available_bytes')
+        reserved_ram = sum(r['ram_mb'] for r in self.allocations.values())
+        if available is None or available / 1048576 < self.policy['ram_reserve_mb'] + reserved_ram + request['ram_mb']:
+            return None
+        if request['gpu_memory_mb']:
+            visible = metadata.launch_environment.get('CUDA_VISIBLE_DEVICES', os.environ.get('CUDA_VISIBLE_DEVICES'))
+            for gpu in snapshot.get('gpus', []):
+                if visible is not None and gpu['id'] not in visible.split(','):
+                    continue
+                reserved_gpu = sum(r['gpu_memory_mb'] for r in self.allocations.values() if r.get('gpu_id') == gpu['id'])
+                if gpu['free_mb'] - reserved_gpu >= request['gpu_memory_mb'] + self.policy['gpu_reserve_mb']:
+                    return {**request, 'gpu_id': gpu['id']}
+            return None
+        return request
+
+    def _validate_runtime(self, runtime, info, python, root, env, auto_install, event):
+        from packaging.specifiers import SpecifierSet
+        from .environment import _run, install_missing
+        if runtime['python_specifier'] and not SpecifierSet(runtime['python_specifier']).contains(info['python_version']):
+            raise ValueError('AI plan requires Python ' + runtime['python_specifier'] + '; selected ' + info['python_version'])
+        if runtime['requirements']:
+            # Inspect installed versions without importing project modules.
+            script = "import importlib.metadata as m,json,sys; print(json.dumps({r:m.version(r) if any(d.metadata['Name'].lower()==r.lower() for d in m.distributions()) else None for r in json.loads(sys.argv[1])}))"
+            from packaging.requirements import Requirement
+            requirements = [Requirement(r) for r in runtime['requirements']]
+            result = _run([python, '-c', script, json.dumps([r.name for r in requirements])], root, env=env)
+            if result['returncode']:
+                raise ValueError('Cannot verify AI runtime constraints')
+            versions = json.loads(result['output'])
+            missing = [str(r) for r in requirements if not versions.get(r.name) or not r.specifier.contains(versions[r.name])]
+            if missing and not auto_install:
+                raise ValueError('AI runtime requirements are not satisfied: ' + ', '.join(missing))
+            if missing:
+                report = install_missing(root, python, missing, cancel=event, env=env)
+                if report['returncode']:
+                    raise ValueError('AI runtime dependency installation failed: ' + report['output'][-8000:])
 
     def environment(self, project_id, python=None, working_directory=None):
         project = self.project(project_id)
@@ -238,7 +368,7 @@ class Workspace:
 
     def project_outputs(self, project_id):
         project = self.project(project_id)
-        detection = project.get('detection') or detect_output_paths(project['path']).to_dict()
+        detection = project.get('detection') or {}
         path_value = detection.get('detected_output_path')
         if not path_value:
             return {'path': None, 'confidence': detection.get('confidence', 'uncertain'), 'exists': False, 'executions': []}
@@ -363,6 +493,8 @@ class Workspace:
                 python = python_path(argv[0])
             argv[0] = python
         pending = []
+        contract = next((e for e in self.catalog(project['id'])['entries'] if e['id'] == data.get('entry_id')), {})
+        commit = _git_commit(Path(project['path']))
         if plan:
             entries = plan['executions']
         else:
@@ -377,9 +509,7 @@ class Workspace:
             command = list(entry['command'])
             if is_python:
                 command[0] = python
-            metadata, _ = prepare_execution(project['path'], command, task=data.get('task', 'train'),
-                                            seed=entry['seed'], repeat=entry['repeat'], output_override=entry['output'],
-                                            env=env, working_directory=working_directory)
+            metadata = self._plan_metadata(project, {**entry, 'command': command}, data, contract, commit)
             metadata.supervisor_id = self.instance_id
             metadata.algorithm = entry.get('algorithm')
             metadata.rl_environment = entry.get('rl_environment')
@@ -408,11 +538,33 @@ class Workspace:
     def _execute(self, metadata, env, event, python=None, auto_install=True):
         try:
             acquired = False
+            claimed = False
+            known = decision(metadata, self.records(), probe=False)
+            if not event.is_set() and known['action'] == 'skipped_completed':
+                apply_decision(metadata, known)
+                metadata.end_time = _now(); metadata.write(self.root)
+                return
+            if metadata.training_contract:
+                import hashlib
+                for source, digest in metadata.training_contract.get('source_hashes', {}).items():
+                    if hashlib.sha256((Path(metadata.project) / source).read_bytes()).hexdigest() != digest:
+                        apply_decision(metadata, {'action': 'needs_attention', 'completed_steps': 0, 'target_steps': metadata.training_steps,
+                            'remaining_steps': metadata.training_steps, 'checkpoint': None, 'message': 'Project source changed since AI analysis; analyze again'})
+                        metadata.end_time = _now(); metadata.write(self.root)
+                        return
             while not event.is_set():
                 with self.lock:
                     snapshot = self.resources()
-                    if self.reserved_slots < self.max_parallel and snapshot.get('cpu_percent', 0) < 90 and (snapshot.get('memory_percent') is None or snapshot['memory_percent'] < 92):
+                    allocation = self._allocation(metadata, snapshot)
+                    identity_available = not metadata.configuration_key or metadata.configuration_key not in self.training_claims
+                    if identity_available and allocation is not None and self.reserved_slots < self.max_parallel and snapshot.get('cpu_percent', 0) < self.policy['cpu_limit']:
                         self.reserved_slots += 1
+                        self.allocations[metadata.execution_id] = allocation
+                        if metadata.configuration_key:
+                            self.training_claims.add(metadata.configuration_key)
+                            claimed = True
+                        if allocation.get('gpu_id') is not None:
+                            env = {**env, 'CUDA_VISIBLE_DEVICES': str(allocation['gpu_id'])}
                         acquired = True
                         break
                 metadata.status = 'queued'; metadata.environment_setup = {**metadata.environment_setup, 'waiting_for_resources': True}; metadata.write(self.root)
@@ -422,7 +574,8 @@ class Workspace:
                 def update(report):
                     metadata.environment_setup.update(report)
                     metadata.write(self.root)
-                root = dependency_root(metadata.working_directory, metadata.project)
+                runtime = metadata.training_contract.get('runtime', {})
+                root = Path(metadata.project) / runtime['dependency_directory'] if runtime else dependency_root(metadata.working_directory, metadata.project)
                 report = prepare_environment(root, python, auto_install=auto_install, cancel=event, update=update, env=env)
                 if report['status'] != 'ready':
                     metadata.status = 'cancelled' if event.is_set() else 'failed'
@@ -431,6 +584,8 @@ class Workspace:
                     metadata.write(self.root)
                     return
                 info = report['inspection_after']
+                if runtime:
+                    self._validate_runtime(runtime, info, python, root, env, auto_install, event)
                 metadata.environment.update(python=info['python_version'], executable=python, prefix=info['prefix'])
                 env = {**env, 'PATH': str(Path(python).parent) + os.pathsep + env.get('PATH', os.environ.get('PATH', ''))}
                 launcher = info.get('mpi_launcher') or {}
@@ -441,11 +596,31 @@ class Workspace:
                 env['PYTHONPATH'] = str(root) + os.pathsep + env.get('PYTHONPATH', os.environ.get('PYTHONPATH', ''))
                 if info['conda_prefix']:
                     env.update(CONDA_PREFIX=info['conda_prefix'], CONDA_DEFAULT_ENV=info['conda_env'])
+            if not event.is_set() and metadata.configuration_key:
+                result = decision(metadata, self.records())
+                apply_decision(metadata, result)
+                metadata.write(self.root)
+                if result['action'] in {'skipped_completed', 'needs_attention'}:
+                    metadata.end_time = _now()
+                    metadata.write(self.root)
+                    return
             def track(process):
                 with self.lock:
                     self.processes[metadata.execution_id] = process
                     self.live_metadata[metadata.execution_id] = metadata
             execute_execution(metadata, self.root, env=env, cancel=event, on_process=track)
+            recovery = metadata.training_contract.get('recovery')
+            completion = metadata.training_contract.get('completion') or {}
+            if metadata.task == 'train':
+                if metadata.status == 'success' and (completion.get('success_means_target') or (recovery or {}).get('success_means_target')):
+                    metadata.completed_steps = metadata.training_steps
+                    metadata.remaining_steps = 0
+                elif recovery:
+                    observed = decision(metadata, [], probe=True)
+                    if observed['action'] in {'resume', 'skipped_completed'}:
+                        metadata.completed_steps = observed['completed_steps']
+                        metadata.checkpoint = observed['checkpoint']
+                metadata.write(self.root)
         except Exception as exc:
             metadata.status, metadata.error = 'failed', str(exc)
             metadata.exit_code, metadata.end_time = 126, _now()
@@ -454,6 +629,9 @@ class Workspace:
             with self.lock:
                 if 'acquired' in locals() and acquired:
                     self.reserved_slots = max(0, self.reserved_slots - 1)
+                self.allocations.pop(metadata.execution_id, None)
+                if claimed:
+                    self.training_claims.discard(metadata.configuration_key)
                 self.jobs.pop(metadata.execution_id, None)
                 self.processes.pop(metadata.execution_id, None)
                 self.live_metadata.pop(metadata.execution_id, None)

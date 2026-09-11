@@ -203,19 +203,6 @@ def dependency_plan(project):
         parse_dependency(item, root)
     for item in plan['constraints']:
         Requirement(item)
-    # This removed API is an explicit compatibility signal, not an import-name guess.
-    from .detector import collect_sources
-    for source, text in collect_sources(root).items():
-        if not source.endswith('.py') or 'registry.all' not in text:
-            continue
-        try:
-            tree = ast.parse(text)
-        except SyntaxError:
-            continue
-        if any(isinstance(node, ast.Call) and ast.unparse(node.func) == 'gym.envs.registry.all' for node in ast.walk(tree)):
-            plan['requirements'].append('gym>=0.21,<0.24')
-            plan['compatibility'].append({'requirement': 'gym>=0.21,<0.24', 'source': source, 'evidence': 'gym.envs.registry.all()', 'reason': 'Legacy Gym registry and four-value step API'})
-            break
     return plan
 
 

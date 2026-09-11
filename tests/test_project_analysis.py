@@ -57,7 +57,11 @@ class ProjectAnalysisTests(unittest.TestCase):
             try:
                 with patch.object(workspace, 'prepare_project_environment'):
                     project = workspace.register(root)
-                result = workspace.analyze(project["id"])
+                from rl_repro_harness.llm import validate_config
+                # The legacy discovery utility is a fixture here, never the Web analysis fallback.
+                fixture_catalog = {**discover(root), 'origin': 'llm', 'outputs': []}
+                with patch('rl_repro_harness.service.load_config', return_value=validate_config({'base_url':'http://127.0.0.1:9','model':'fixture'})), patch('rl_repro_harness.service.analyze_project', return_value=fixture_catalog):
+                    result = workspace.analyze(project["id"])
                 entry = next(e for e in result["analysis"]["catalog"]["entries"] if e["project_name"] == "FlowRL")
                 defaults = workspace.defaults(project["id"])
                 self.assertEqual(len(defaults["seeds"].split(",")), 30)
@@ -77,7 +81,7 @@ class ProjectAnalysisTests(unittest.TestCase):
                 data["selections"]["seeds"] = [0]
                 ids = workspace.launch(data)
                 record = workspace.record(ids[0])
-                record.update(status="success",exit_code=0)
+                record.update(status="success",exit_code=0,completed_steps=5000000)
                 workspace._write(workspace.root / "executions" / (ids[0]+".json"), record)
                 repeated = workspace.command_plan(data)
                 self.assertEqual(repeated["completed_pairs"][0]["algorithm"], "flowac")

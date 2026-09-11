@@ -36,6 +36,35 @@ optional `RL_HARNESS_LLM_API_KEY` environment variables.
 
 ## Detect a project's output path
 
+In Web **Project setup**, **Analyze** refreshes the subproject catalog and a
+read-only dependency report. Each subproject is scanned separately, including
+repositories inside `external/`, `projects/`, and `baselines/`. Expand a
+subproject's report for dependency files, pip options, unsupported declarations,
+and the scan limits. Analysis does not install dependencies or execute project
+code. Optional LLM output-path analysis retains its evidence validation and
+no-tools policy.
+
+Discovery recognizes argparse, literal custom `add_arg` declarations,
+Abseil flags, and fields passed through `tyro.cli`. Source scans are limited to
+64 subprojects, 100 files per subproject, and 128,000 bytes per source file.
+Dynamic CLI declarations and unsupported dependency syntax remain explicit
+limitations. Pip editable/VCS/URL/local targets, nested requirements, constraints,
+and supported index/binary options retain their installation semantics.
+
+The run form groups entry points by subproject and scopes algorithm/environment
+options to the chosen entry. Filter options, select all visible options, clear,
+or drag a rectangle from blank space in a selection area. New training runs
+default to seeds `0..29` and `5,000,000` total environment steps. Total steps
+are mapped to a confirmed project argument; an unknown argument blocks the
+preview until the command explicitly provides a supported total-step flag.
+At most 4,096 executions can be created per request.
+
+Command previews use the same matrix builder as execution. Completed
+algorithm/environment pairs are compared using Harness records for the same
+project and working directory, with seed and step count shown. A completed pair
+prompts before submission; it does not imply every seed or parameter setting is
+complete. Training outside Harness cannot be classified from output files.
+
 The Web **Project setup** view also lists source-derived algorithms, environment
 IDs, runnable scripts, README commands and CLI flags for multi-project
 repositories. Register `~/AI/RL/Safe-Reinforcement-Learning-Baselines`, select

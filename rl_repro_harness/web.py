@@ -83,7 +83,7 @@ def make_server(workspace, host="127.0.0.1", port=8765):
                     return self.send(400, {"error": str(exc)})
             if path == "/api/browse":
                 try:
-                    requested = parse_qs(urlsplit(self.path).query).get("path", [str(Path.home())])[0]
+                    requested = parse_qs(urlsplit(self.path).query).get("path", [str(Path.cwd())])[0]
                     directory = Path(requested).expanduser().resolve()
                     if not directory.is_dir():
                         raise ValueError("Directory does not exist")
@@ -131,7 +131,7 @@ def make_server(workspace, host="127.0.0.1", port=8765):
                 elif path == "/api/launch":
                     result = {"execution_ids": workspace.launch(data)}
                 elif path == '/api/command':
-                    result = describe_command(data['command']) if data.get('describe') else build_commands(data)
+                    result = describe_command(data['command']) if data.get('describe') else (workspace.command_plan(data) if data.get('project_id') else build_commands(data))
                 elif path == "/api/cancel":
                     workspace.cancel(data["execution_id"])
                     result = {"status": "cancelling"}

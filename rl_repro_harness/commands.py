@@ -9,6 +9,8 @@ ALIASES = {
     'environments': ('--env', '--environment', '--env-id', '--env_id'),
     'seeds': ('--seed', '--random-seed', '--random_seed'),
 }
+STEP_FLAGS = ('--total-timesteps', '--total_timesteps', '--timesteps', '--num_steps',
+              '--max_steps', '--max-steps', '--training_steps', '--training-steps')
 
 
 def arguments(command):
@@ -73,6 +75,17 @@ def build_commands(data):
     dimensions = []
     placeholders = ('{algorithm}', '{env}', '{seeds}')
     flags = data.get('flags', [])
+    if data.get('steps') is not None:
+        steps = data['steps']
+        if type(steps) is not int or steps < 1:
+            raise ValueError('Training steps must be a positive integer')
+        found = option(argv, STEP_FLAGS)
+        step_flag = data.get('steps_flag') or (found[0] if found else next((f for f in STEP_FLAGS if f in flags), None))
+        if not step_flag:
+            raise ValueError('Training step argument is unconfirmed for this entry point')
+        if step_flag not in STEP_FLAGS:
+            raise ValueError('Unsupported training step flag')
+        argv = replace_option(argv, STEP_FLAGS, step_flag, str(steps))
     for (name, aliases), placeholder in zip(ALIASES.items(), placeholders):
         values = selections.get(name, [])
         if not isinstance(values, list) or len(values) > 64:
@@ -87,15 +100,23 @@ def build_commands(data):
         found = option(argv, aliases)
         flag = found[0] if found else next((a for a in aliases if a in flags), aliases[0])
         if values:
-            argv = replace_option(argv, aliases, flag, placeholder)
+            if data.get('bindings') is not None and not data['bindings'].get(name) and not found:
+                if name == 'algorithms' and len(values) == 1:
+                    continue
+                if name == 'environments' and data.get('environment_arguments'):
+                    continue
+                if name == 'environments' and len(values) == 1 and data.get('fixed_environment'):
+                    continue
+                raise ValueError('No confirmed argument for ' + name)
+            argv = replace_option(argv, aliases, data.get('bindings', {}).get(name) or flag, placeholder)
     repeats = data.get('repeats', 1)
     if type(repeats) is not int or not 1 <= repeats <= 20:
         raise ValueError('Repeats must be between 1 and 20')
     count = repeats
     for values in dimensions:
         count *= len(values)
-    if count > 64:
-        raise ValueError('At most 64 executions per request')
+    if count > 4096:
+        raise ValueError('At most 4096 executions per request')
     python = data.get('python')
     if python and re.fullmatch(r'python(?:\d+(?:\.\d+)?)?(?:\.exe)?', Path(argv[0]).name):
         argv[0] = python
@@ -110,6 +131,13 @@ def build_commands(data):
                     arg = arg.replace(key, str(value))
             return arg
         command = [substitute(a) for a in argv]
+        if data.get('environment_arguments') and environment is not None:
+            mapped = data['environment_arguments'].get(environment)
+            if not mapped:
+                raise ValueError('Unknown environment selection')
+            for index in range(0, len(mapped), 2):
+                command = replace_option(command, (mapped[index],), mapped[index], mapped[index + 1])
         executions.append({'command': command, 'display': shlex.join(command), 'seed': seed,
+                           'algorithm': algorithm, 'rl_environment': environment, 'steps': data.get('steps'),
                            'repeat': repeat, 'output': substitute(data['output']) if data.get('output') else None})
     return {'template': shlex.join(argv), 'executions': executions}

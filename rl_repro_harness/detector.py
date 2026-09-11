@@ -74,7 +74,7 @@ def collect_sources(root: Path) -> dict[str, str]:
     def visit(directory: Path, in_sources: bool = False, depth: int = 0) -> None:
         if len(sources) >= 100 or depth > 8:
             return
-        for path in sorted(directory.iterdir()):
+        for path in sorted(directory.iterdir(), key=lambda p: (p.is_dir(), p.name)):
             if path.is_symlink() or path.name.startswith(".") or path.name in _IGNORE:
                 continue
             if path.is_dir():

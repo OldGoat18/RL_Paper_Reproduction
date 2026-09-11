@@ -7,11 +7,64 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from rl_repro_harness.environment import dependency_plan, inspect_environment, prepare_environment
+from rl_repro_harness.environment import dependency_plan, inspect_environment, prepare_environment, install_missing
+from rl_repro_harness.dependencies import parse_dependency
 from rl_repro_harness.service import Workspace
 
 
 class EnvironmentTests(unittest.TestCase):
+    def test_editable_sources_survive_plan_inspection_and_install(self):
+        target = 'git+https://github.com/vwxyzjn/cleanrl.git@004f8a086a892a2a180f4dd332b90d83a968aa7a#egg=cleanrl'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'requirements.txt').write_text('-e ' + target + '\n')
+            info = inspect_environment(root)
+            self.assertIn('-e ' + target, info['missing_dependencies'])
+            with patch('rl_repro_harness.environment._run', return_value={'returncode': 0, 'output': ''}) as run:
+                install_missing(root, sys.executable, info['missing_dependencies'])
+            self.assertEqual(run.call_args.args[0][-2:], ['--editable', target])
+            with patch('rl_repro_harness.environment.install_missing', return_value={'returncode': 0, 'output': ''}):
+                self.assertEqual(prepare_environment(root)['status'], 'ready')
+
+    def test_source_formats_and_markers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / 'local package'
+            local.mkdir()
+            for text in ('-e "./local package"', '--editable=./local package', '--editable ./local package'):
+                dep = parse_dependency(text, root)
+                self.assertTrue(dep.source)
+                self.assertEqual(dep.install_args, ['--editable', str(local)])
+            for text in ('https://example.test/pkg.whl', 'git+https://example.test/pkg.git',
+                         'pkg @ https://example.test/pkg.whl'):
+                self.assertTrue(parse_dependency(text, root).source)
+            (root / 'requirements.txt').write_text('absent-for-test; python_version < "1"\n')
+            self.assertEqual(inspect_environment(root)['missing_dependencies'], [])
+
+    def test_conda_pip_editables_and_requirements_includes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'requirements.txt').write_text('-r "nested req.txt"\n-c constraints.txt\n')
+            (root / 'nested req.txt').write_text('--index-url https://example.test/simple\n--only-binary=mujoco\nrequests>=2\n')
+            (root / 'constraints.txt').write_text('requests<3\n')
+            (root / 'environment.yml').write_text('dependencies:\n  - pip:\n    - "-e git+https://example.test/pkg.git#egg=pkg"\n')
+            info = inspect_environment(root)
+            self.assertEqual(info['constraints'], ['requests<3'])
+            self.assertIn('-e git+https://example.test/pkg.git#egg=pkg', info['requirements'])
+            with patch('rl_repro_harness.environment._run', return_value={'returncode': 0, 'output': ''}) as run:
+                install_missing(root, sys.executable, ['requests>=2'], pip_options=info['pip_options'])
+            command = run.call_args.args[0]
+            self.assertIn('--index-url', command)
+            self.assertIn('https://example.test/simple', command)
+            self.assertIn('--only-binary', command)
+
+    def test_invalid_requirement_has_source_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'requirements.txt').write_text('# comment\n--unsupported-pip-option\n')
+            with self.assertRaisesRegex(ValueError, r'requirements.txt:2: Unsupported pip directive'):
+                dependency_plan(root)
+
     def test_setup_py_mpi_dependency_is_detected_and_native_import_checked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

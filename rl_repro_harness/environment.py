@@ -5,6 +5,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 from packaging.specifiers import SpecifierSet
+from .dependencies import parse_dependency
 
 try:
     import tomllib
@@ -24,7 +26,7 @@ except ImportError:
 
 
 PREPARATION_LOCK = threading.Lock()
-MANIFESTS = ('requirements.txt', 'pyproject.toml', 'setup.cfg', 'setup.py', 'environment.yml', 'environment.yaml')
+MANIFESTS = ('requirements.txt', 'requirements .txt', 'pyproject.toml', 'setup.cfg', 'setup.py', 'environment.yml', 'environment.yaml')
 
 
 def current_python():
@@ -76,7 +78,35 @@ def dependency_root(directory, boundary=None):
 
 def dependency_plan(project):
     root = Path(project).resolve()
-    plan = {'dependency_files': [], 'requirements': [], 'constraints': [], 'conda': [], 'channels': [], 'python_requires': None, 'compatibility': []}
+    plan = {'dependency_files': [], 'requirements': [], 'constraints': [], 'pip_options': [], 'conda': [], 'channels': [], 'python_requires': None, 'compatibility': []}
+
+    def add_dependency(line, source, constraint=False):
+        try:
+            if constraint:
+                Requirement(line)
+            else:
+                parse_dependency(line, root)
+        except ValueError as exc:
+            raise ValueError(f"{source}: {exc}") from exc
+        plan['constraints' if constraint else 'requirements'].append(line)
+
+    def pip_option(line):
+        words = shlex.split(line)
+        key, sep, value = words[0].partition('=')
+        with_value = {'--index-url', '-i', '--extra-index-url', '--find-links', '-f',
+                      '--trusted-host', '--only-binary', '--no-binary'}
+        if key in with_value:
+            if (sep and len(words) != 1) or (not sep and len(words) != 2):
+                raise ValueError("Expected one value for " + key)
+            value = value if sep else words[1]
+            if not value or value.startswith('-'):
+                raise ValueError("Invalid value for " + key)
+            plan['pip_options'].extend([key, value])
+            return True
+        if key in {'--no-index', '--pre', '--prefer-binary'} and len(words) == 1 and not sep:
+            plan['pip_options'].append(key)
+            return True
+        return False
 
     def requirements_file(path, constraint=False, visited=None):
         visited = set() if visited is None else visited
@@ -85,23 +115,28 @@ def dependency_plan(project):
             raise ValueError('Invalid or recursive requirements include')
         visited.add(path)
         plan['dependency_files'].append(str(path.relative_to(root)))
-        for line in path.read_text(encoding='utf-8').splitlines():
+        content = re.sub(r"\\\r?\n", "", path.read_text(encoding='utf-8'))
+        for number, line in enumerate(content.splitlines(), 1):
             line = re.split(r'\s+#', line, 1)[0].strip()
             if not line or line.startswith('#'):
                 continue
             include = re.match(r'^(?:-r\s*|--requirement(?:=|\s+))(.+)$', line)
             constraints = re.match(r'^(?:-c\s*|--constraint(?:=|\s+))(.+)$', line)
             if include or constraints:
-                requirements_file(path.parent / (include or constraints).group(1), bool(constraints), visited)
-            elif constraint:
-                Requirement(line)
-                plan['constraints'].append(line)
+                filename = shlex.split((include or constraints).group(1))
+                if len(filename) != 1:
+                    raise ValueError(f"{path}:{number}: Invalid requirements include")
+                requirements_file(path.parent / filename[0], constraint or bool(constraints), visited)
             else:
-                Requirement(line)
-                plan['requirements'].append(line)
+                try:
+                    handled = pip_option(line) if line.startswith('-') else False
+                except ValueError as exc:
+                    raise ValueError(f"{path}:{number}: {exc}") from exc
+                if not handled:
+                    add_dependency(line, f"{path}:{number}", constraint)
         visited.remove(path)
 
-    req = root / 'requirements.txt'
+    req = root / ('requirements.txt' if (root / 'requirements.txt').is_file() else 'requirements .txt')
     if req.is_file():
         requirements_file(req)
     pyproject = root / 'pyproject.toml'
@@ -109,7 +144,8 @@ def dependency_plan(project):
         plan['dependency_files'].append('pyproject.toml')
         document = tomllib.loads(pyproject.read_text(encoding='utf-8'))
         metadata = document.get('project', {})
-        plan['requirements'].extend(metadata.get('dependencies', []))
+        for item in metadata.get('dependencies', []):
+            add_dependency(item, str(pyproject))
         plan['python_requires'] = metadata.get('requires-python')
         if 'dependencies' in metadata.get('dynamic', []):
             raise ValueError('Dynamic pyproject dependencies require a static requirements declaration')
@@ -135,7 +171,8 @@ def dependency_plan(project):
                         except (ValueError, TypeError, KeyError):
                             raise ValueError('Cannot statically resolve setup.py dependencies; provide requirements.txt')
                         if kw.arg == 'install_requires':
-                            plan['requirements'].extend(value)
+                            for item in value:
+                                add_dependency(item, str(setup))
                         else:
                             plan['python_requires'] = value
     cfg = root / 'setup.cfg'
@@ -144,7 +181,9 @@ def dependency_plan(project):
         parser = configparser.ConfigParser(interpolation=None)
         parser.read(cfg)
         plan['dependency_files'].append('setup.cfg')
-        plan['requirements'].extend(line.strip() for line in parser.get('options', 'install_requires', fallback='').splitlines() if line.strip())
+        for line in parser.get('options', 'install_requires', fallback='').splitlines():
+            if line.strip():
+                add_dependency(line.strip(), str(cfg))
         plan['python_requires'] = parser.get('options', 'python_requires', fallback=plan['python_requires'])
     envfile = next((root / name for name in ('environment.yml', 'environment.yaml') if (root / name).is_file()), None)
     if envfile:
@@ -155,10 +194,14 @@ def dependency_plan(project):
             if isinstance(dep, str):
                 plan['conda'].append(dep)
             elif isinstance(dep, dict) and set(dep) == {'pip'}:
-                plan['requirements'].extend(dep['pip'])
+                for line in dep['pip']:
+                    if not pip_option(line):
+                        add_dependency(line, str(envfile) + ":pip")
             else:
                 raise ValueError('Unsupported Conda dependency declaration')
-    for item in plan['requirements'] + plan['constraints']:
+    for item in plan['requirements']:
+        parse_dependency(item, root)
+    for item in plan['constraints']:
         Requirement(item)
     # This removed API is an explicit compatibility signal, not an import-name guess.
     from .detector import collect_sources
@@ -240,18 +283,24 @@ def inspect_environment(project, python=None, env=None):
     marker_env = {**identity, 'python_full_version': identity['python_version'], 'python_version': '.'.join(identity['python_version'].split('.')[:2]), 'extra': ''}
     missing = []
     for text in plan['requirements']:
-        req = Requirement(text)
+        dependency = parse_dependency(text, root)
+        req = dependency.requirement
+        if req is None:
+            missing.append(text)
+            continue
         if req.marker and not req.marker.evaluate(marker_env):
             continue
         version = packages.get(canonicalize_name(req.name))
-        if version is None or not req.specifier.contains(version, prereleases=True) or req.extras or req.url:
+        if version is None or not req.specifier.contains(version, prereleases=True) or req.extras or dependency.source:
             missing.append(text)
     constraints = [Requirement(text) for text in plan['constraints']]
     for req in constraints:
         if req.marker and not req.marker.evaluate(marker_env):
             continue
         for text in plan['requirements']:
-            base = Requirement(text)
+            base = parse_dependency(text, root).requirement
+            if base is None:
+                continue
             version = packages.get(canonicalize_name(base.name))
             if canonicalize_name(base.name) == canonicalize_name(req.name) and version and not req.specifier.contains(version, prereleases=True):
                 missing.append(str(req))
@@ -262,7 +311,8 @@ def inspect_environment(project, python=None, env=None):
     is_conda = (conda_prefix / 'conda-meta').is_dir()
     native = None
     launcher = None
-    if any(canonicalize_name(Requirement(r).name) == 'mpi4py' for r in plan['requirements']) and 'mpi4py' in packages:
+    named = [parse_dependency(r, root).requirement for r in plan['requirements']]
+    if any(req and canonicalize_name(req.name) == 'mpi4py' for req in named) and 'mpi4py' in packages:
         native = _run([interpreter, '-c', 'from mpi4py import MPI; print(MPI.Get_library_version())'], root, timeout=20, env=env)
         if not native['returncode']:
             launcher = mpi_launcher(interpreter, native['output'], root, env)
@@ -299,12 +349,11 @@ def inspect_environment(project, python=None, env=None):
     return {**identity, **plan, 'python': interpreter, 'conda_env': ('base' if conda_prefix.name.lower() in {'anaconda3', 'miniconda3'} else conda_prefix.name) if is_conda else None, 'conda_prefix': str(conda_prefix) if is_conda else None, 'dependency_root': str(root), 'declared_dependencies': plan['requirements'], 'missing_dependencies': sorted(set(missing)), 'conda_pending': conda_pending, 'native_check': native, 'mpi_launcher': launcher, 'errors': errors, 'ready': not (missing or errors or conda_pending or native and native['returncode'])}
 
 
-def install_missing(project, python, missing, cancel=None, env=None):
+def install_missing(project, python, missing, cancel=None, env=None, pip_options=()):
     if not missing:
         return {'attempted': False, 'installed': [], 'returncode': 0, 'output': ''}
-    for value in missing:
-        Requirement(value)
-    command = [python_path(python), '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '--upgrade-strategy', 'only-if-needed', *missing]
+    arguments = [arg for value in missing for arg in parse_dependency(value, project).install_args]
+    command = [python_path(python), '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '--upgrade-strategy', 'only-if-needed', *pip_options, *arguments]
     result = _run(command, project, cancel, env=env)
     return {**result, 'attempted': True, 'installed': missing if result['returncode'] == 0 else []}
 
@@ -335,8 +384,10 @@ def prepare_environment(project, python=None, *, auto_install=True, cancel=None,
             if not any(s['returncode'] for s in report['steps']) and info['missing_dependencies']:
                 report.update(status='installing', packages=info['missing_dependencies'])
                 notify(report.copy())
-                constraints = [r for r in info['constraints'] if canonicalize_name(Requirement(r).name) in {canonicalize_name(Requirement(m).name) for m in info['missing_dependencies']}]
-                report['steps'].append(install_missing(project, info['python'], info['missing_dependencies'] + constraints, cancel, env))
+                names = {canonicalize_name(req.name) for m in info['missing_dependencies']
+                         for req in [parse_dependency(m, project).requirement] if req is not None}
+                constraints = [r for r in info['constraints'] if canonicalize_name(Requirement(r).name) in names]
+                report['steps'].append(install_missing(project, info['python'], info['missing_dependencies'] + constraints, cancel, env, pip_options=info['pip_options']))
             bad = next((s for s in report['steps'] if s['returncode']), None)
             if bad:
                 report.update(status='cancelled' if bad['returncode'] == 130 else 'failed', error=bad['output'] or 'Dependency installer failed')
@@ -344,7 +395,12 @@ def prepare_environment(project, python=None, *, auto_install=True, cancel=None,
                 checked = inspect_environment(project, info['python'], env=env) if report['steps'] else info
                 report['inspection_after'] = checked
                 # pip itself resolves extras; a successful install verifies those requirements.
-                unresolved = [r for r in checked['missing_dependencies'] if not Requirement(r).extras and not Requirement(r).url]
+                unresolved = [r for r in checked['missing_dependencies']
+                              for dep in [parse_dependency(r, project)]
+                              if not dep.source and not dep.requirement.extras]
+                # Source targets need a successful pip resolution in this preparation.
+                if not report['steps']:
+                    unresolved.extend(r for r in checked['missing_dependencies'] if parse_dependency(r, project).source)
                 ready = not (unresolved or checked['errors'] or checked['conda_pending'] or checked['native_check'] and checked['native_check']['returncode'])
                 report.update(status='ready' if ready else 'failed')
                 if not ready:

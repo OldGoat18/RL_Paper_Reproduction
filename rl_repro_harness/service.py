@@ -19,6 +19,7 @@ from pathlib import Path
 from .detector import detect_output_paths
 from .commands import build_commands
 from .metadata import ExecutionMetadata
+from .discovery import discover, LIMITS
 from .llm import detect_with_llm, load_config, save_config, test_connection, validate_config
 from .runner import _now, execute_execution, prepare_execution
 from .environment import conda_environments, current_python, dependency_root, inspect_environment, prepare_environment, python_path, MANIFESTS
@@ -95,64 +96,8 @@ class Workspace:
 
     def catalog(self, project_id):
         project = self.project(project_id)
-        root = Path(project["path"])
-        ignored = {".git", ".venv", "venv", "__pycache__", "node_modules", "runs", "results", "logs", "data", "artifacts", "build", "dist"}
-        algorithms = {"ppo", "sac", "td3", "ddpg", "dqn", "a2c", "trpo", "pcpo", "cpo", "lagrangian", "mbpo", "mbrl", "safety layer", "leave no trace"}
-        environments = set(); entries = []; commands = []
-        command_re = re.compile(r"(?m)^\s*((?:python(?:\d+(?:\.\d+)?)?|python\s+-m)\s+[^\n`]+)")
-        for doc in sorted(list(root.rglob("README")) + list(root.rglob("README.md")) + list(root.rglob("README.rst"))):
-            if any(part in ignored for part in doc.parts):
-                continue
-            try:
-                text = doc.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            for match in command_re.finditer(text):
-                command = match.group(1).strip().rstrip(".;")
-                if "python" not in command.lower() or any(x in command for x in ("|", ">", "&&", "<")) or len(command) > 500:
-                    continue
-                command_algorithms = sorted(name for name in algorithms if re.search(r"(?<![a-z])" + re.escape(name) + r"(?![a-z])", command.lower()))
-                command_envs = re.findall(r"(?:[A-Za-z][A-Za-z0-9_]*-(?:v|V)\d+|Safety[A-Za-z0-9_-]+)", command)
-                directory = str(doc.parent.relative_to(root) or Path("."))
-                command_entry = {"id": f"command:{doc.relative_to(root)}:{len(commands)}", "path": command, "directory": directory, "source": str(doc.relative_to(root)), "command": command, "algorithms": command_algorithms or ["Unclassified"], "environments": command_envs, "flags": re.findall(r"--[A-Za-z0-9_-]+", command), "confidence": "high" if command_algorithms and command_envs else "medium", "runnable": True}
-                commands.append(command_entry)
-                entries.append(command_entry)
-        for path in sorted(root.rglob("*.py")):
-            if any(part in ignored for part in path.parts) or len(entries) >= 300:
-                continue
-            try:
-                text = path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            environments.update(re.findall(r"(?:[A-Za-z][A-Za-z0-9_]*-(?:v|V)\d+|Safety[A-Za-z0-9_-]+)", text))
-            lower = text.lower() + " " + path.stem.lower()
-            found = sorted(name for name in algorithms if re.search(r"(?<![a-z])" + re.escape(name) + r"(?![a-z])", lower))
-            runnable = bool(re.search(r"if\s+__name__\s*==\s*['\"]__main__['\"]", text)) or path.name.startswith(("train", "run", "main", "experiment", "benchmark"))
-            if not runnable:
-                continue
-            parser_flags = []; parser_defaults = {}
-            try:
-                tree = ast.parse(text)
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "add_argument":
-                        values = [a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
-                        if values:
-                            parser_flags.extend(values)
-                            default = next((kw.value.value for kw in node.keywords if kw.arg == "default" and isinstance(kw.value, ast.Constant)), None)
-                            if default is not None:
-                                for value in values:
-                                    parser_defaults[value] = str(default)
-            except SyntaxError:
-                pass
-            entries.append({"id": str(path.relative_to(root)), "path": str(path.relative_to(root)), "directory": str(path.parent.relative_to(root) or Path('.')), "source": str(path.relative_to(root)), "command": f"{{python}} {path.relative_to(root)}", "algorithms": found or ["Unclassified"], "environments": sorted(re.findall(r"(?:[A-Za-z][A-Za-z0-9_]*-(?:v|V)\d+|Safety[A-Za-z0-9_-]+)", text))[:32], "flags": sorted(set(parser_flags))[:64], "defaults": parser_defaults, "confidence": "medium" if found else "uncertain", "runnable": True})
-        # Keep the catalog useful without overwhelming the UI with duplicate README/script entries.
-        unique = []
-        seen = set()
-        for entry in entries:
-            key = entry["command"]
-            if key not in seen:
-                seen.add(key); unique.append(entry)
-        return {"project_id": project_id, "project_path": str(root), "algorithms": sorted({a for e in unique for a in e["algorithms"]}), "environments": sorted(environments), "entries": unique[:300], "notes": ["Entries are source-derived; the harness does not install dependencies or modify project files.", "Old, missing, or incompatible dependencies remain the responsibility of each subproject.", "Commands shown from README files are project-authored examples; verify dependencies and arguments before starting a run."]}
+        cached = project.get('analysis', {}).get('catalog')
+        return cached or {**discover(project['path']), 'project_id': project_id}
 
     def defaults(self, project_id):
         """Return only defaults backed by project-authored evidence."""
@@ -168,10 +113,14 @@ class Workspace:
         environment = (entry.get("environments") or [None])[0] if entry else None
         seed_default = (entry.get("defaults") or {}).get("--seed", "") if entry else ""
         detection = detect_output_paths(project["path"], shlex.split(command.replace("{python}", sys.executable)) if command else ())
-        return {"project_id": project_id, "task": "train", "command": command.replace("{python}", sys.executable) if command else "", "working_directory": directory, "environment": environment or "", "seeds": seed_default or ("1" if command and "{seed}" in command else ""), "repeats": "1", "output": detection.detected_output_path or "", "source": "project preset" if preset else (entry.get("source") if entry else None), "confidence": "high" if command else "uncertain"}
+        return {"project_id": project_id, "task": "train", "command": command.replace("{python}", sys.executable) if command else "", "working_directory": directory, "environment": environment or "", "seeds": ", ".join(map(str, range(30))), "steps": 5000000, "entry_id": entry["id"] if entry else None, "repeats": "1", "output": detection.detected_output_path or "", "source": "project preset" if preset else (entry.get("source") if entry else None), "confidence": "high" if command else "uncertain"}
 
     def analyze(self, project_id, command="", llm=False):
         project = self.project(project_id)
+        catalog = {**discover(project["path"], include_dependencies=True), "project_id": project_id}
+        with self.lock:
+            project["analysis"] = {"catalog": catalog, "limits": LIMITS, "analyzed_at": _now()}
+            self._write(self.registry, self.projects)
         argv = shlex.split(command) if isinstance(command, str) else command
         if llm:
             config = load_config(self.root)
@@ -183,7 +132,41 @@ class Workspace:
         with self.lock:
             project["detection"] = result
             self._write(self.registry, self.projects)
-        return result
+        return {**result, "analysis": project["analysis"]}
+
+    def command_plan(self, data):
+        payload = dict(data)
+        if data.get('entry_id'):
+            entry = next((e for e in self.catalog(data['project_id'])['entries'] if e['id'] == data['entry_id']), None)
+            if entry is None:
+                raise ValueError('Entry point not found; analyze the project again')
+            for key in ('algorithms', 'environments'):
+                if any(value not in entry[key] for value in data.get('selections', {}).get(key, [])):
+                    raise ValueError('Unsupported ' + key + ' for this entry point')
+            payload.update({key: entry[key] for key in ('bindings', 'environment_arguments', 'steps_flag', 'flags')})
+            payload['fixed_environment'] = len(entry['environments']) == 1 and not entry['bindings']['environments']
+        plan = build_commands(payload)
+        project = self.project(data['project_id'])
+        directory = str(self._working_directory(project, data.get('working_directory')))
+        history = [r for r in self.records() if r.get('project') == project['path'] and r.get('status') == 'success'
+                   and r.get('task') == data.get('task', 'train')
+                   and str(Path(r.get('working_directory') or r['project']).resolve()) == directory]
+        from .commands import describe_command, option
+        completed = []
+        for execution in plan['executions']:
+            for record in history:
+                description = describe_command(record.get('command', []))
+                algorithm = record.get('algorithm') or next(iter(description['algorithms']), None)
+                environment = record.get('rl_environment') or next(iter(description['environments']), None)
+                domain = option(record.get('command', []), ('--domain',))
+                task = option(record.get('command', []), ('--task',))
+                if not environment and domain and task:
+                    environment = domain[1] + '/' + task[1]
+                if (algorithm, environment) == (execution['algorithm'], execution['rl_environment']) and algorithm and environment:
+                    completed.append({'algorithm': algorithm, 'environment': environment, 'seed': record.get('seed'),
+                                      'steps': record.get('training_steps'), 'execution_id': record['execution_id']})
+        plan['completed_pairs'] = list({r['execution_id']: r for r in completed}.values())
+        return plan
 
     def records(self):
         records = []
@@ -232,7 +215,7 @@ class Workspace:
             config_error = None
         except ValueError:
             config, config_error = None, "Stored AI configuration is invalid"
-        return {"projects": self.projects, "executions": self.records(), "llm_available": config is not None, "llm": config.public_dict() if config else None, "llm_error": config_error, "python": current_python(), "python_environments": self.python_environments, "metadata_root": str(self.root), "resources": self.resources()}
+        return {"projects": self.projects, "executions": self.records(), "llm_available": config is not None, "llm": config.public_dict() if config else None, "llm_error": config_error, "python": current_python(), "python_environments": self.python_environments, "metadata_root": str(self.root), "working_directory": str(Path.cwd()), "resources": self.resources()}
 
     def resources(self):
         try:
@@ -343,7 +326,7 @@ class Workspace:
 
     def launch(self, data):
         project = self.project(data["project_id"])
-        plan = build_commands(data) if 'selections' in data else None
+        plan = self.command_plan(data) if 'selections' in data else None
         argv = shlex.split(data["command"]) if isinstance(data["command"], str) else data["command"]
         if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
             raise ValueError("Enter a command")
@@ -398,6 +381,9 @@ class Workspace:
                                             seed=entry['seed'], repeat=entry['repeat'], output_override=entry['output'],
                                             env=env, working_directory=working_directory)
             metadata.supervisor_id = self.instance_id
+            metadata.algorithm = entry.get('algorithm')
+            metadata.rl_environment = entry.get('rl_environment')
+            metadata.training_steps = entry.get('steps')
             metadata.environment_setup = {'status': 'queued', 'python': python}
             metadata.launch_environment = dict(env)
             pending.append(metadata)

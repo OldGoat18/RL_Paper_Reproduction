@@ -35,6 +35,9 @@ class ExecutionMetadata:
     stderr: str = ""
     resource_request: dict[str, object] = field(default_factory=dict)
     launch_environment: dict[str, str] = field(default_factory=dict)
+    algorithm: Optional[str] = None
+    rl_environment: Optional[str] = None
+    training_steps: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
